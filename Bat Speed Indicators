@@ -1,0 +1,183 @@
+# Inputs:
+# bat speed 2025.csv      pulled from Statcast, shows avg. Bat Speed for all players with >10 at bats in 2025
+# mlb_2025_batters.csv    pulled from baseballr
+# swing length 2025.csv   pulled from statcast
+
+# Packages
+pkgs <- c("readr", "dplyr", "stringr", "broom", "ggplot2", "ggrepel", "cowplot")
+inst <- pkgs[!pkgs %in% installed.packages()[,1]]
+if (length(inst)) install.packages(inst)
+library(readr); library(dplyr); library(stringr); library(broom)
+library(ggplot2); library(ggrepel); library(cowplot)
+
+# Read and clean inputs
+bat <- read_csv("bat speed 2025.csv", show_col_types = FALSE, col_types = cols(.default = "c"))
+people <- read_csv("mlb_2025_batters.csv", show_col_types = FALSE, col_types = cols(.default = "c"))
+swing <- read_csv("swing length 2025.csv", show_col_types = FALSE, col_types = cols(.default = "c"))
+norm <- function(df) { names(df) <- tolower(gsub("[^a-z0-9_]", "_", names(df))); df }
+bat <- norm(bat); people <- norm(people); swing <- norm(swing)
+
+if ("id" %in% names(people) && !"player_id" %in% names(people)) people <- people %>% rename(player_id = id)
+if ("id" %in% names(swing) && !"player_id" %in% names(swing)) swing <- swing %>% rename(player_id = id)
+if ("player_id" %in% names(bat)) bat$player_id <- as.character(bat$player_id) else stop("bat file needs player_id")
+
+# Coalesce name, height, weight, age, strike zone from people table
+name_cands <- c("full_name","display_name","name","player_name","player")
+height_cands <- c("height","height_feet","height_ft","height_inches","height_in")
+weight_cands <- c("weight","weight_lbs","weight_lb","weight")
+age_cands <- c("current_age","age")
+szt_cands <- c("strike_zone_top","strike_top","sz_top")
+szb_cands <- c("strike_zone_bottom","strike_bottom","sz_bottom")
+pick <- function(df, cands) intersect(cands, names(df))
+
+# Build coalesced columns within a pipe
+people_tmp <- people %>% mutate(player_id = as.character(player_id))
+name_cols <- pick(people_tmp, name_cands)
+if (length(name_cols) > 0) {
+  people_tmp$player_name <- do.call(dplyr::coalesce, people_tmp[name_cols])
+} else people_tmp$player_name <- NA_character_
+height_cols <- pick(people_tmp, height_cands)
+weight_cols <- pick(people_tmp, weight_cands)
+age_cols <- pick(people_tmp, age_cands)
+szt_cols <- pick(people_tmp, szt_cands)
+szb_cols <- pick(people_tmp, szb_cands)
+
+# Run checks on data
+people_tmp$height_raw <- if (length(height_cols)>0) do.call(dplyr::coalesce, people_tmp[height_cols]) else NA_character_
+people_tmp$weight_raw <- if (length(weight_cols)>0) do.call(dplyr::coalesce, people_tmp[weight_cols]) else NA_character_
+people_tmp$current_age <- if (length(age_cols)>0) as.numeric(do.call(dplyr::coalesce, people_tmp[age_cols])) else NA_real_
+people_tmp$sz_top <- if (length(szt_cols)>0) as.numeric(do.call(dplyr::coalesce, people_tmp[szt_cols])) else NA_real_
+people_tmp$sz_bottom <- if (length(szb_cols)>0) as.numeric(do.call(dplyr::coalesce, people_tmp[szb_cols])) else NA_real_
+
+# Cleaned data after merging sources
+people2 <- dplyr::select(people_tmp, player_id, player_name, height_raw, weight_raw, current_age, sz_top, sz_bottom)
+
+# Parse height/weight and normalize (handle feet & inches, feet numeric, and pounds)
+parse_height_feet <- function(x) {
+  x <- as.character(x)
+  x[trimws(x)==""] <- NA
+  out <- rep(NA_real_, length(x))
+  # feet'inches patterns like 6'2" or 6 2 or 6-2
+  m <- str_match(x, "^\\s*(\\d{1,2})\\s*['′`\\-\\s]+\\s*(\\d{1,2})(?:\\\"|\\s*)?$")
+  idx <- which(!is.na(m[,1]))
+  if (length(idx)) out[idx] <- as.numeric(m[idx,2]) + as.numeric(m[idx,3]) / 12
+  # numeric values: treat > 7 as inches? but user said raw was in feet; treat numbers > 3 as feet
+  num_idx <- which(is.na(out) & !is.na(suppressWarnings(as.numeric(x))))
+  if (length(num_idx)) {
+    val <- as.numeric(x[num_idx])
+    out[num_idx] <- ifelse(val > 3 & val < 9, val, NA_real_) # assume feet when between 3 and 9
+  }
+  out
+}
+parse_weight_lbs <- function(x) {
+  x <- as.character(x)
+  x[trimws(x)==""] <- NA
+  out <- suppressWarnings(as.numeric(x))
+  out
+}
+
+people2 <- people2 %>%
+  mutate(height_feet = parse_height_feet(height_raw),
+         weight_lbs = parse_weight_lbs(weight_raw))
+
+# Merge bat speed + people ID file + swing length files
+bat <- bat %>% mutate(player_id = as.character(player_id),
+                      avg_swing_speed = as.numeric(gsub("[^0-9\\.\\-]", "", avg_swing_speed)))
+merged1 <- inner_join(bat, people2, by = "player_id")
+merged <- left_join(merged1, dplyr::select(swing, player_id, swing_length), by = "player_id")
+merged <- merged %>%
+  mutate(swing_length = as.numeric(swing_length)) # swing_length in feet per user attachment
+
+# Compute strike_zone_height (sz_top and sz_bottom are in feet)
+merged <- merged %>% mutate(strike_zone_height = ifelse(!is.na(sz_top) & !is.na(sz_bottom), sz_top - sz_bottom, NA_real_))
+
+# Unit conversions and BMI calculations, convert height_feet -> inches and meters; weight_lbs -> pounds (kept) and kg
+merged <- merged %>%
+  mutate(
+    height_in = ifelse(!is.na(height_feet), height_feet * 12, NA_real_),
+    height_m = ifelse(!is.na(height_feet), height_feet * 0.3048, NA_real_),
+    weight_kg = ifelse(!is.na(weight_lbs), weight_lbs * 0.45359237, NA_real_),
+    bmi_metric = ifelse(!is.na(weight_kg) & !is.na(height_m) & height_m>0, weight_kg / (height_m^2), NA_real_),
+    bmi_imperial = ifelse(!is.na(weight_lbs) & !is.na(height_in) & height_in>0, 703 * weight_lbs / (height_in^2), NA_real_)
+  )
+
+# Final dataset:
+df_small <- merged %>%
+  dplyr::select(player_id, player_name, avg_swing_speed, height_feet, height_in, height_m,
+                weight_lbs, weight_kg, bmi_metric, bmi_imperial, current_age, strike_zone_height, swing_length)
+write_csv(df_small, "bat_speed_merged_small.csv")
+
+# Standardize columns (z-score) within a model dataframe
+zscale <- function(df, cols) {
+  for (c in cols) {
+    zname <- paste0("z_", c)
+    df[[zname]] <- as.numeric(scale(as.numeric(df[[c]])))
+  }
+  df
+}
+
+# Model A: height (inches), weight (pounds), strike_zone_height (feet), swing_length (feet), age
+df_hw <- df_small %>%
+  mutate(across(c(avg_swing_speed, height_in, weight_lbs, current_age, strike_zone_height, swing_length), as.numeric)) %>%
+  filter(!is.na(avg_swing_speed) & !is.na(height_in) & !is.na(weight_lbs) & !is.na(current_age) & !is.na(strike_zone_height)) %>%
+  zscale(c("height_in", "weight_lbs", "current_age", "strike_zone_height", "swing_length"))
+
+lm_hw <- lm(avg_swing_speed ~ z_height_in + z_weight_lbs + z_current_age + z_strike_zone_height + z_swing_length, data = df_hw)
+summary_hw <- summary(lm_hw)
+coefs_hw <- broom::tidy(lm_hw, conf.int = TRUE)
+
+# Model B: BMI (imperial), strike_zone_height (feet), swing_length (feet), age
+df_bmi <- df_small %>%
+  mutate(across(c(avg_swing_speed, bmi_imperial, current_age, strike_zone_height, swing_length), as.numeric)) %>%
+  filter(!is.na(avg_swing_speed) & !is.na(bmi_imperial) & !is.na(current_age) & !is.na(strike_zone_height) & !is.na(swing_length)) %>%
+  zscale(c("bmi_imperial", "current_age", "strike_zone_height", "swing_length"))
+
+lm_bmi <- lm(avg_swing_speed ~ z_bmi_imperial + z_current_age + z_strike_zone_height + z_swing_length, data = df_bmi)
+summary_bmi <- summary(lm_bmi)
+coefs_bmi <- broom::tidy(lm_bmi, conf.int = TRUE)
+
+
+# Create Scatters
+plot_vars <- list(
+  swing_length = list(col = "swing_length", xlab = "Swing length (feet)"),
+  bmi = list(col = "bmi_imperial", xlab = "BMI (imperial)"),
+  age = list(col = "current_age", xlab = "Age (years)"),
+  height = list(col = "height_in", xlab = "Height (inches)"),
+  weight = list(col = "weight_lbs", xlab = "Weight (pounds)"),
+  zone = list(col = "strike_zone_height", xlab = "Strike zone height (feet)")
+)
+
+make_scatter <- function(df, xcol, xlab, label_rows = NULL, label_name_col = "player_name") {
+  p <- ggplot(df %>% filter(!is.na(avg_swing_speed) & !is.na(.data[[xcol]])),
+              aes_string(x = xcol, y = "avg_swing_speed")) +
+    geom_point(alpha = 0.55, size = 1.6, color = "#1f78b4") +
+    geom_smooth(method = "lm", se = TRUE, color = "#e31a1c", size = 0.8, formula = y ~ x) +
+    geom_smooth(method = "loess", se = TRUE, color = "#33a02c", linetype = "dashed", size = 0.8) +
+    labs(title = paste("Avg swing speed vs", xlab), x = xlab, y = "Avg swing speed (mph)") +
+    theme_minimal(base_size = 12)
+  if (!is.null(label_rows) && nrow(label_rows)>0) {
+    p <- p + geom_point(data = label_rows, aes_string(x = xcol, y = "avg_swing_speed"), color = "#ff7f00", size = 3) +
+      geom_text_repel(data = label_rows, aes_string(x = xcol, y = "avg_swing_speed", label = label_name_col),
+                      size = 3.4, box.padding = 0.35, point.padding = 0.4, max.overlaps = 20)
+  }
+  p
+}
+
+# Label Elly De La Cruz and Alejandro Kirk
+label_players <- df_small %>% filter(!is.na(player_name)) %>%
+  filter(str_detect(player_name, regex("Kirk.*Alejandro|Alejandro.*Kirk|Kirk, Alejandro", ignore_case = TRUE)) |
+           str_detect(player_name, regex("De La Cruz.*Elly|Elly.*De La Cruz|De La Cruz, Elly", ignore_case = TRUE)))
+
+plot_list <- list()
+for (vn in names(plot_vars)) {
+  col <- plot_vars[[vn]]$col
+  xlab <- plot_vars[[vn]]$xlab
+  p <- make_scatter(df = df_small, xcol = col, xlab = xlab, label_rows = if (vn=="bmi") label_players else NULL)
+  fname <- paste0("plot_bat_speed_vs_", vn, ".png")
+  ggsave(fname, p, width = 7, height = 5, dpi = 300)
+  plot_list[[vn]] <- p
+  cat("Saved", fname, "\n")
+}
+
+grid <- plot_grid(plotlist = plot_list, ncol = 2, labels = names(plot_list), label_size = 10)
+print(grid)
