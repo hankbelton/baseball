@@ -11,4 +11,4 @@ R code behind my writing at https://henryjbelton.substack.com
 Data comes from Baseball Savant, FanGraphs, and baseballr. Raw files are not included, so see each folder for how to pull them.
 
 ## Author
-Henry Belton, Chicago Booth MBA. [Link](https://www.linkedin.com/in/henryjbelton/)
+Henry Belton, Chicago Booth MBA. [LinkedIn](https://www.linkedin.com/in/henryjbelton/)
