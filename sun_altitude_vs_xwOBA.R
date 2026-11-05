@@ -1,7 +1,6 @@
 # Setup
 manual_hand_map_file <- "manual_hand_map.csv"
 schedule_map_file <- "schedule_map.csv"
-setwd("/Users/hbelt/OneDrive/Documents/Baseball")
 
 install_if_missing <- function(pkgs){
   missing <- pkgs[!pkgs %in% rownames(installed.packages())]
